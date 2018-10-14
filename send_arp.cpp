@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <libnet.h>
 #include <pcap.h>
+#include "ether_arp.h"
 
 #define IP_ADDR_LEN 4
 
@@ -47,72 +48,56 @@ void get_mac_address(char *interface, uint8_t *mac){
 }
 
 void send_arp_packet(pcap_t *handle, uint8_t *src_mac_adr, uint8_t *src_ip_adr, uint8_t *dst_mac_adr, uint8_t *dst_ip_adr, uint16_t op_code){
-    uint8_t p[50];
-    uint8_t *pos = p;
+    ethernet_arp packet;
 
     //fill the ethernet header
-    memcpy(pos , dst_mac_adr, ETHER_ADDR_LEN);  pos += ETHER_ADDR_LEN;
-    memcpy(pos, src_mac_adr, ETHER_ADDR_LEN);   pos += ETHER_ADDR_LEN;
-    (*(uint16_t *)pos) = htons(ETHERTYPE_ARP);    pos += 2;
+    memcpy(packet.eth_hdr.ether_dhost , dst_mac_adr, 6);
+    memcpy(packet.eth_hdr.ether_shost, src_mac_adr, 6);
+    packet.eth_hdr.ether_type = htons(ETHERTYPE_ARP);
 
     //fill the ARP header
-    (*(uint16_t *)pos) = htons(ARPHRD_ETHER); pos += 2;
-    (*(uint16_t *)pos) = htons(ETHERTYPE_IP);   pos += 2;
-    *pos = ETHER_ADDR_LEN;    pos += 1;
-    *pos = IP_ADDR_LEN; pos += 1;
-    (*(uint16_t *)pos) = htons(op_code);  pos += 2;
+    packet.arp_hdr.ar_hrd = htons(ARPHRD_ETHER);
+    packet.arp_hdr.ar_pro = htons(ETHERTYPE_IP);
+    packet.arp_hdr.ar_hln = ETHER_ADDR_LEN;
+    packet.arp_hdr.ar_pln = IP_ADDR_LEN;
+    packet.arp_hdr.ar_op = htons(op_code);
 
     //fill the ARP DATA
-    memcpy(pos, src_mac_adr, ETHER_ADDR_LEN);   pos += ETHER_ADDR_LEN;
-    memcpy(pos, src_ip_adr, 4); pos += 4;
+    memcpy(packet.sdr_hardware_adr, src_mac_adr, 6);
+    memcpy(packet.sdr_protocol_adr, src_ip_adr, 4);
 
     int ck_broadcast_mac = 1;
     for(int i = 0 ; i < 6 ; i++) if(dst_mac_adr[i] != 0xff) ck_broadcast_mac = 0;
-    if(ck_broadcast_mac) for(int i = 0 ; i < 6 ; i++) pos[i] = 0x00;
-    else memcpy(pos, dst_mac_adr, ETHER_ADDR_LEN);  
-    pos += ETHER_ADDR_LEN;
+    if(ck_broadcast_mac) for(int i = 0 ; i < 6 ; i++) packet.trg_hardware_adr[i] = 0x00;
+    else memcpy(packet.trg_hardware_adr, dst_mac_adr, 6);  
     
-    memcpy(pos, dst_ip_adr, 4); pos += 4;
+    memcpy(packet.trg_protocol_adr, dst_ip_adr, 4);
 
-    unsigned int arp_packet_len = sizeof(libnet_ethernet_hdr) + sizeof(libnet_arp_hdr) + 20;
-    pcap_sendpacket(handle, p, arp_packet_len);
+    pcap_sendpacket(handle, (const u_char *)&packet, sizeof(ethernet_arp));
 }
 
 bool check_packet(const u_char *p, int len, uint8_t *atk_mac_adr, uint8_t *atk_ip_adr, uint8_t *sdr_ip_adr){
-    const u_char *pos = p;
+    const ethernet_arp *pos = (const ethernet_arp *)p;
 
-    if(memcmp((uint8_t *)pos, atk_mac_adr, 6)) return false;
-    pos += ETHER_ADDR_LEN;
+    if(memcmp(pos->eth_hdr.ether_dhost, atk_mac_adr, 6)) return false;
 
-    pos += ETHER_ADDR_LEN;
+    if(ntohs(pos->eth_hdr.ether_type) != ETHERTYPE_ARP) return false;
 
-    if(ntohs(*(uint16_t *)pos) != ETHERTYPE_ARP) return false;
-    pos += 2;
-
-    if(ntohs(*(uint16_t *)pos) != ARPHRD_ETHER) return false;
-    pos += 2;
+    if(ntohs(pos->arp_hdr.ar_hrd) != ARPHRD_ETHER) return false;
  
-    if(ntohs(*(uint16_t *)pos) != ETHERTYPE_IP) return false;
-    pos += 2;
+    if(ntohs(pos->arp_hdr.ar_pro) != ETHERTYPE_IP) return false;
 
-    if((*pos) != 0x06) return false;
-    pos += 1;
+    if((pos->arp_hdr.ar_hln) != 0x06) return false;
 
-    if((*pos) != 0x04) return false;
-    pos += 1;
+    if((pos->arp_hdr.ar_pln) != 0x04) return false;
 
-    if(ntohs(*(uint16_t *)pos) != ARPOP_REPLY) return false;
-    pos += 2;
+    if(ntohs(pos->arp_hdr.ar_op) != ARPOP_REPLY) return false;
 
-    pos += 6;
+    if((*(uint32_t *)(pos->sdr_protocol_adr)) != (*(uint32_t *)sdr_ip_adr)) return false;
 
-    if((*(uint32_t *)pos) != (*(uint32_t *)sdr_ip_adr)) return false;
-    pos += 4;
+    if(memcmp(pos->trg_hardware_adr, atk_mac_adr, 6)) return false;
 
-    if(memcmp((uint8_t *)pos, atk_mac_adr, 6)) return false;
-    pos += 6;
-
-    if((*(uint32_t *)pos) != (*(uint32_t *)atk_ip_adr)) return false;
+    if((*(uint32_t *)(pos->trg_protocol_adr)) != (*(uint32_t *)atk_ip_adr)) return false;
 
     return true;
 }
@@ -169,6 +154,7 @@ int main(int argc, char **argv){
     get_mac_address(dev, atk_mac_adr);
     get_ip_address(dev, atk_ip_adr);
 
+    printf("%d\n", sizeof(ethernet_arp));
     printf("--------------------------------------------\n");
     print_mac_adr(atk_mac_adr);
     print_ip_adr(atk_ip_adr);
